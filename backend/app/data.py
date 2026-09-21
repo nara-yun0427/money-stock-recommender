@@ -24,6 +24,7 @@ PRICES_CACHE = CACHE_DIR / "prices.parquet"
 STATUS_CACHE = CACHE_DIR / "status.json"
 
 PRICE_HISTORY_DAYS = 1400  # 3년 이상 지표(750거래일) 계산에 필요한 여유 확보
+LIQUIDITY_SCAN_DAYS = 35  # 1차 유동성 스캔은 짧은 기간만 받아 메모리를 아낀다
 LIQUIDITY_TOP_N = 300
 FETCH_WORKERS = 24
 CACHE_MAX_AGE_HOURS = 20
@@ -87,6 +88,23 @@ def _fetch_one(code: str, start: str):
     return d
 
 
+def _fetch_recent_liquidity(code: str, start: str) -> float | None:
+    """가벼운 1차 스캔: 최근 20거래일 평균 거래대금만 계산하고 나머지는 버린다."""
+    try:
+        d = fdr.DataReader(code, start)
+    except Exception:
+        return None
+    if d is None or d.empty or "Close" not in d.columns:
+        return None
+    tail = d.tail(20)
+    if tail.empty:
+        return None
+    value = float((tail["Close"] * tail["Volume"]).mean())
+    if not value or value <= 0:
+        return None
+    return value
+
+
 def build_cache(limit_codes: int | None = None) -> None:
     if not _build_lock.acquire(blocking=False):
         return  # 이미 빌드 중
@@ -100,40 +118,58 @@ def build_cache(limit_codes: int | None = None) -> None:
         codes = listing["Code"].tolist()
         if limit_codes:
             codes = codes[:limit_codes]
-        start_date = (datetime.now() - timedelta(days=PRICE_HISTORY_DAYS)).strftime(
-            "%Y-%m-%d"
-        )
 
-        frames = []
+        # 1단계: 전 종목을 짧은 기간(35일)만 훑어서 유동성 상위 종목만 추린다.
+        # 2,500개 전 종목을 3년치씩 한꺼번에 메모리에 올리면(무료 서버 512MB 기준)
+        # 메모리 초과로 죽을 수 있어서, 무거운 전체 히스토리는 상위 종목만 받는다.
+        scan_start = (datetime.now() - timedelta(days=LIQUIDITY_SCAN_DAYS)).strftime("%Y-%m-%d")
+        liquidity: dict[str, float] = {}
         done = 0
         total = len(codes)
         with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as ex:
-            futures = {ex.submit(_fetch_one, c, start_date): c for c in codes}
+            futures = {ex.submit(_fetch_recent_liquidity, c, scan_start): c for c in codes}
+            for fut in as_completed(futures):
+                code = futures[fut]
+                value = fut.result()
+                if value is not None:
+                    liquidity[code] = value
+                done += 1
+                if done % 100 == 0 or done == total:
+                    _write_status(state="building", progress=round(done / total * 30, 1))
+
+        if not liquidity:
+            _write_status(state="error", error="유동성 데이터를 하나도 가져오지 못했습니다.")
+            return
+
+        top_codes = sorted(liquidity, key=liquidity.get, reverse=True)[:LIQUIDITY_TOP_N]
+
+        # 2단계: 유동성 상위 종목만 3년치 전체 히스토리를 받는다.
+        start_date = (datetime.now() - timedelta(days=PRICE_HISTORY_DAYS)).strftime("%Y-%m-%d")
+        frames = []
+        done = 0
+        total2 = len(top_codes)
+        with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as ex:
+            futures = {ex.submit(_fetch_one, c, start_date): c for c in top_codes}
             for fut in as_completed(futures):
                 res = fut.result()
                 if res is not None and len(res) >= 40:
                     frames.append(res)
                 done += 1
-                if done % 50 == 0 or done == total:
-                    _write_status(state="building", progress=round(done / total * 100, 1))
+                if done % 20 == 0 or done == total2:
+                    _write_status(state="building", progress=round(30 + done / total2 * 70, 1))
 
         if not frames:
             _write_status(state="error", error="가격 데이터를 하나도 가져오지 못했습니다.")
             return
 
         prices = pd.concat(frames, ignore_index=True)
+        fetched_codes = set(prices["Code"].unique())
 
-        recent = prices.sort_values("Date").groupby("Code").tail(20)
-        liquidity = (recent["Close"] * recent["Volume"]).groupby(recent["Code"]).mean()
-        top_codes = liquidity.sort_values(ascending=False).head(LIQUIDITY_TOP_N).index
-
-        final_listing = listing[listing["Code"].isin(top_codes)].copy()
+        final_listing = listing[listing["Code"].isin(fetched_codes)].copy()
         final_listing["avg_trading_value_20d"] = final_listing["Code"].map(liquidity)
         final_listing = final_listing.sort_values(
             "avg_trading_value_20d", ascending=False
         ).reset_index(drop=True)
-
-        prices = prices[prices["Code"].isin(top_codes)].reset_index(drop=True)
 
         final_listing.to_parquet(LISTING_CACHE, index=False)
         prices.to_parquet(PRICES_CACHE, index=False)
