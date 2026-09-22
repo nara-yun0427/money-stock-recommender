@@ -34,7 +34,7 @@ def status():
 
 @app.post("/api/refresh")
 def refresh():
-    data.ensure_cache_async(force=True)
+    data.refresh_now()
     return {"ok": True}
 
 

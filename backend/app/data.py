@@ -185,6 +185,74 @@ def build_cache(limit_codes: int | None = None) -> None:
         _build_lock.release()
 
 
+REFRESH_RECENT_DAYS = 10  # 새로고침은 이 기간만 다시 받아서 기존 캐시에 이어붙인다
+
+
+def refresh_recent_prices() -> None:
+    """'새로고침' 버튼용: 이미 확보한 유니버스의 최근 시세만 빠르게 갱신한다.
+
+    build_cache()처럼 전체 종목을 다시 스캔하지 않고, 이미 캐시에 있는 약 300개
+    종목에 대해서만 최근 며칠치 시세를 받아 기존 데이터에 이어붙인다. 전체 재구축
+    대비 요청 수가 훨씬 적어서(2,500+300 -> 300) 몇 분이 아니라 수십 초 안에 끝난다.
+    """
+    if not _build_lock.acquire(blocking=False):
+        return  # 이미 다른 빌드/새로고침이 진행 중
+    try:
+        listing = load_universe()
+        if listing.empty:
+            # 캐시가 아예 없으면 새로고침으로는 부족하니 전체 재구축으로 넘어간다.
+            _build_lock.release()
+            build_cache()
+            return
+
+        _write_status(state="building", started_at=datetime.now().isoformat(), progress=0)
+
+        codes = listing["Code"].tolist()
+        start_date = (datetime.now() - timedelta(days=REFRESH_RECENT_DAYS)).strftime("%Y-%m-%d")
+
+        frames = []
+        done = 0
+        total = len(codes)
+        with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as ex:
+            futures = {ex.submit(_fetch_one, c, start_date): c for c in codes}
+            for fut in as_completed(futures):
+                res = fut.result()
+                if res is not None:
+                    frames.append(res)
+                done += 1
+                if done % 20 == 0 or done == total:
+                    _write_status(state="building", progress=round(done / total * 100, 1))
+
+        if not frames:
+            # 새 데이터를 못 받았으면 기존 캐시를 그대로 유지한다.
+            _write_status(state="ready", error=None)
+            return
+
+        new_prices = pd.concat(frames, ignore_index=True)
+        old_prices = load_prices()
+        combined = pd.concat([old_prices, new_prices], ignore_index=True)
+        combined = combined.drop_duplicates(subset=["Code", "Date"], keep="last")
+
+        cutoff = pd.Timestamp(datetime.now() - timedelta(days=PRICE_HISTORY_DAYS))
+        combined = combined[combined["Date"] >= cutoff].sort_values(["Code", "Date"])
+        combined = combined.reset_index(drop=True)
+
+        combined.to_parquet(PRICES_CACHE, index=False)
+
+        _write_status(
+            state="ready",
+            built_at=datetime.now().isoformat(),
+            progress=100,
+            universe_size=len(listing),
+            error=None,
+        )
+    finally:
+        try:
+            _build_lock.release()
+        except RuntimeError:
+            pass  # 위에서 이미 넘겨준 경우(전체 재구축 폴백)
+
+
 def ensure_cache_async(force: bool = False) -> None:
     status = get_status()
     is_stale = True
@@ -195,6 +263,17 @@ def ensure_cache_async(force: bool = False) -> None:
     if status.get("state") == "building":
         return
     if force or status.get("state") in (None, "empty", "error") or is_stale:
+        threading.Thread(target=build_cache, daemon=True).start()
+
+
+def refresh_now() -> None:
+    """'새로고침' 버튼이 호출하는 진입점. 캐시가 있으면 가볍게, 없으면 전체 재구축."""
+    status = get_status()
+    if status.get("state") == "building":
+        return
+    if LISTING_CACHE.exists():
+        threading.Thread(target=refresh_recent_prices, daemon=True).start()
+    else:
         threading.Thread(target=build_cache, daemon=True).start()
 
 
