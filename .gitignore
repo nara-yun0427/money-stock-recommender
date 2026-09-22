@@ -7,3 +7,9 @@ backend/__pycache__/
 
 frontend/node_modules/
 frontend/dist/
+
+budget/backend/venv/
+budget/backend/data/*.db
+budget/backend/__pycache__/
+budget/frontend/node_modules/
+budget/frontend/dist/
