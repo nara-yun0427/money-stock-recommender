@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: my-budget-app
+    runtime: docker
+    dockerfilePath: ./budget/Dockerfile
+    dockerContext: .
+    plan: free
+    envVars:
+      - key: BUDGET_PIN
+        sync: false
+      - key: SECRET_KEY
+        generateValue: true
+      - key: COOKIE_SECURE
+        value: "true"
+      - key: DATABASE_URL
+        sync: false
