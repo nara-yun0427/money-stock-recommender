@@ -23,10 +23,14 @@ const METRIC_LABELS = {
   swing_amplitude: '스윙폭',
   above_ma120: '120일선대비',
   avg_trading_value_5d: '최근거래대금',
+  avg_volume_5d: '최근거래량',
+  runup_6m: '6개월최대상승',
+  mdd_6m: '6개월최대하락',
 }
 
 const RAW_PCT_KEYS = new Set(['swing_pullback'])
 const CURRENCY_KEYS = new Set(['avg_trading_value_5d'])
+const COUNT_KEYS = new Set(['avg_volume_5d'])
 
 function formatPct(v) {
   if (v === null || v === undefined) return '-'
@@ -81,9 +85,11 @@ function StockCard({ item }) {
                 ? `${v}x`
                 : CURRENCY_KEYS.has(k)
                   ? `${v.toLocaleString('ko-KR')}억`
-                  : RAW_PCT_KEYS.has(k)
-                    ? `${v}%`
-                    : formatPct(v)}
+                  : COUNT_KEYS.has(k)
+                    ? `${v.toLocaleString('ko-KR')}주`
+                    : RAW_PCT_KEYS.has(k)
+                      ? `${v}%`
+                      : formatPct(v)}
             </span>
           ))}
       </div>

@@ -14,6 +14,13 @@ import pandas as pd
 # 모든 키워드 공통으로 "최근에도 실제 거래가 살아있는 종목"만 추천 대상에 남긴다.
 MIN_RECENT_TRADING_VALUE = 3_000_000_000  # 최근 5거래일 평균 거래대금 30억원 이상
 MIN_VOL_RATIO = 0.3  # 최근 거래량이 60일 평균의 30% 밑으로 식은 종목은 제외
+MIN_DAILY_VOLUME = 4_000_000  # 최근 5거래일 평균 거래량(주식 수) 400만주 이상
+
+# 단타·스윙 전용 추가 필터: 최근 6개월 안에 +20% 이상 랠리 & -20% 이상 조정이
+# 둘 다 있었던(=스윙 폭이 충분한) 종목 중에서, 최근 1년 추세는 꾸준히 우상향인 것만.
+SWING_LOOKBACK_DAYS = 126  # 약 6개월
+SWING_MIN_RUNUP = 0.20
+SWING_MIN_DRAWDOWN = -0.20
 
 KEYWORD_CONFIG = {
     "단타": {
@@ -74,6 +81,9 @@ FACTOR_LABELS = {
     "above_ma120": "추세 유지(120일선 위)",
     "swing_amplitude": "스윙 변동폭",
     "avg_trading_value_5d": "최근 거래대금",
+    "avg_volume_5d": "최근 거래량",
+    "runup_6m": "6개월 최대 상승폭",
+    "mdd_6m": "6개월 최대 하락폭",
 }
 
 
@@ -112,6 +122,7 @@ def _indicators(g: pd.DataFrame) -> dict | None:
         vol_ratio = np.nan
 
     avg_trading_value_5d = float(np.mean(close[-5:] * volume[-5:]))
+    avg_volume_5d = float(np.mean(volume[-5:]))
 
     def mdd(days: int):
         window = close[-days:] if n >= days else close
@@ -119,7 +130,16 @@ def _indicators(g: pd.DataFrame) -> dict | None:
         dd = (window - peak) / peak
         return float(dd.min())
 
+    def runup(days: int):
+        window = close[-days:] if n >= days else close
+        trough = np.minimum.accumulate(window)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ru = np.where(trough > 0, (window - trough) / trough, np.nan)
+        return float(np.nanmax(ru)) if np.any(~np.isnan(ru)) else np.nan
+
     mdd250 = mdd(250)
+    mdd_6m = mdd(SWING_LOOKBACK_DAYS) if n >= SWING_LOOKBACK_DAYS else np.nan
+    runup_6m = runup(SWING_LOOKBACK_DAYS) if n >= SWING_LOOKBACK_DAYS else np.nan
 
     # 스윙(눌림목) 지표: 최근 20거래일의 고점/저점 대비 현재 위치
     if n >= 20:
@@ -155,6 +175,9 @@ def _indicators(g: pd.DataFrame) -> dict | None:
         "swing_amplitude": swing_amplitude,
         "above_ma120": above_ma120,
         "avg_trading_value_5d": avg_trading_value_5d,
+        "avg_volume_5d": avg_volume_5d,
+        "mdd_6m": mdd_6m,
+        "runup_6m": runup_6m,
     }
 
 
@@ -193,11 +216,24 @@ def recommend(
 
     ind = ind.merge(universe[["Code", "Name", "Market"]], on="Code", how="inner")
 
-    # 공통 유동성 필터: 최근 거래대금이 충분하고, 거래량이 최근에 심하게 식지 않은 종목만 남긴다.
+    # 공통 유동성 필터: 최근 거래대금·거래량이 충분하고, 거래량이 최근에 심하게 식지 않은 종목만 남긴다.
     ind = ind[ind["avg_trading_value_5d"] >= MIN_RECENT_TRADING_VALUE]
+    ind = ind[ind["avg_volume_5d"] >= MIN_DAILY_VOLUME]
     ind = ind[ind["vol_ratio"].fillna(1.0) >= MIN_VOL_RATIO]
     if ind.empty:
         return []
+
+    if keyword in ("단타", "스윙"):
+        # 최근 6개월 안에 +20% 이상 랠리와 -20% 이상 조정이 둘 다 있었던(=스윙 폭이
+        # 충분한) 종목 중에서, 최근 1년 추세는 꾸준히 우상향인 것만 남긴다.
+        ind = ind[
+            (ind["runup_6m"] >= SWING_MIN_RUNUP)
+            & (ind["mdd_6m"] <= SWING_MIN_DRAWDOWN)
+            & (ind["ret250"] > 0)
+            & (ind["above_ma120"] > 0)
+        ]
+        if ind.empty:
+            return []
 
     score = pd.Series(0.0, index=ind.index)
     for metric, direction, weight in cfg["factors"]:
@@ -236,6 +272,11 @@ def recommend(
                     "avg_trading_value_5d": None
                     if pd.isna(r.get("avg_trading_value_5d"))
                     else round(float(r["avg_trading_value_5d"]) / 1e8, 1),
+                    "avg_volume_5d": None
+                    if pd.isna(r.get("avg_volume_5d"))
+                    else round(float(r["avg_volume_5d"])),
+                    "runup_6m": _pct(r.get("runup_6m")),
+                    "mdd_6m": _pct(r.get("mdd_6m")),
                 },
             }
         )
